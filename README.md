@@ -1,14 +1,14 @@
-# Prime Tech Enterprise — Full Workflow System (TH/EN)
+# Prime Tech Enterprise — Ultimate Full Workflow System (TH/EN)
 
-ระบบต้นแบบแบบ **เต็มระบบของจริง** สำหรับงานบริการองค์กร (ลิฟต์, UPS, ทีมภาคสนาม) พร้อมทั้ง CLI, API และ Web Dashboard สองภาษา TH/EN
+ระบบฟรีแบบครบวงจรสำหรับงานบริการองค์กร (ลิฟต์ / UPS / ทีมช่างภาคสนาม) พร้อม CLI, API, Web Dashboard, workflow gate processing, ticket lifecycle และเครื่องมือทดสอบอัตโนมัติ
 
-## Features
-- TH/EN master data: client, project, task
-- Service tickets / incident tracking
-- KPI dashboard (project progress, task completion, open tickets)
-- CSV export for reporting
-- Audit log for traceability
-- Built-in Web Portal + REST API (no external framework)
+## What is included
+- Workflow core: client/project/task/ticket + audit log
+- Stage-gate progression (`gate_0` -> `gate_4`)
+- Ticket lifecycle (open -> in_progress -> resolved -> closed)
+- TH/EN dashboard and reporting API
+- CSV export for external BI
+- End-to-end smoke script + unit tests
 
 ## Quick Start
 ```bash
@@ -16,9 +16,9 @@ bash tools/run_demo.sh
 python3 src/enterprise_workflow.py --db data/workflow.db serve-web --port 8080
 ```
 
-Open: `http://127.0.0.1:8080`
+Open `http://127.0.0.1:8080`
 
-## Main Commands
+## Main CLI Commands
 - `init-db`
 - `seed-full-system`
 - `dashboard`
@@ -26,6 +26,8 @@ Open: `http://127.0.0.1:8080`
 - `add-project`
 - `add-task`
 - `update-task`
+- `advance-gate`
+- `close-ticket`
 - `export-csv`
 - `serve-web`
 
@@ -35,7 +37,16 @@ Open: `http://127.0.0.1:8080`
 - `GET /api/tasks.csv`
 - `POST /api/task/update`
 - `POST /api/ticket/create`
+- `POST /api/project/advance-gate`
+- `POST /api/ticket/close`
 
-## Documentation
+## Validation Commands
+```bash
+python3 -m py_compile src/enterprise_workflow.py
+python3 -m unittest discover -s tests
+bash tools/full_system_check.sh
+```
+
+## Documents
 - `docs/workflow_full_service_th.md`
 - `docs/workflow_full_service_th_en.md`

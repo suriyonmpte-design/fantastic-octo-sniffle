@@ -13,12 +13,13 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
 
 DB_DEFAULT = "data/workflow.db"
-
-ALLOWED_TASK_STATUSES = ["todo", "in_progress", "blocked", "done"]
-ALLOWED_PROJECT_STATUSES = ["planning", "active", "on_hold", "done"]
+ALLOWED_TASK_STATUSES = {"todo", "in_progress", "blocked", "done"}
+ALLOWED_PROJECT_STATUSES = {"planning", "active", "on_hold", "done"}
+ALLOWED_TICKET_STATUSES = {"open", "in_progress", "resolved", "closed"}
+STAGE_GATES = ["gate_0", "gate_1", "gate_2", "gate_3", "gate_4"]
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS clients (
@@ -95,6 +96,7 @@ class WorkflowDB:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
         return conn
 
     def _now(self) -> str:
@@ -131,6 +133,8 @@ class WorkflowDB:
     def add_project(self, client_id: int, code: str, name_th: str, name_en: str, scope_th: str, scope_en: str, start_date: str, due_date: str, status: str = "planning", stage_gate: str = "gate_0") -> int:
         if status not in ALLOWED_PROJECT_STATUSES:
             raise ValueError(f"invalid project status: {status}")
+        if stage_gate not in STAGE_GATES:
+            raise ValueError(f"invalid stage gate: {stage_gate}")
         with self.connect() as conn:
             cur = conn.execute(
                 """
@@ -143,6 +147,19 @@ class WorkflowDB:
             project_id = int(cur.lastrowid)
         self._log("add_project", {"project_id": project_id, "code": code})
         return project_id
+
+    def advance_project_gate(self, project_id: int) -> str:
+        with self.connect() as conn:
+            row = conn.execute("SELECT stage_gate FROM projects WHERE id = ?", (project_id,)).fetchone()
+            if row is None:
+                raise ValueError("project not found")
+            current = row["stage_gate"]
+            index = STAGE_GATES.index(current)
+            next_gate = STAGE_GATES[min(index + 1, len(STAGE_GATES) - 1)]
+            conn.execute("UPDATE projects SET stage_gate = ? WHERE id = ?", (next_gate, project_id))
+            conn.commit()
+        self._log("advance_project_gate", {"project_id": project_id, "from": current, "to": next_gate})
+        return next_gate
 
     def add_task(self, project_id: int, phase: str, title_th: str, title_en: str, owner: str, priority: str, estimate_hours: float, due_date: str, status: str = "todo") -> int:
         if status not in ALLOWED_TASK_STATUSES:
@@ -160,7 +177,23 @@ class WorkflowDB:
         self._log("add_task", {"task_id": task_id, "title_en": title_en})
         return task_id
 
+    def update_task(self, task_id: int, status: str, actual_hours: float | None = None) -> None:
+        if status not in ALLOWED_TASK_STATUSES:
+            raise ValueError(f"invalid task status: {status}")
+        with self.connect() as conn:
+            row = conn.execute("SELECT id FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            if row is None:
+                raise ValueError("task not found")
+            if actual_hours is None:
+                conn.execute("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?", (status, self._now(), task_id))
+            else:
+                conn.execute("UPDATE tasks SET status = ?, actual_hours = ?, updated_at = ? WHERE id = ?", (status, actual_hours, self._now(), task_id))
+            conn.commit()
+        self._log("update_task", {"task_id": task_id, "status": status, "actual_hours": actual_hours})
+
     def add_ticket(self, project_id: int, ticket_code: str, category: str, severity: str, title: str, assignee: str, status: str = "open") -> int:
+        if status not in ALLOWED_TICKET_STATUSES:
+            raise ValueError(f"invalid ticket status: {status}")
         with self.connect() as conn:
             cur = conn.execute(
                 """
@@ -174,16 +207,17 @@ class WorkflowDB:
         self._log("add_ticket", {"ticket_id": ticket_id, "ticket_code": ticket_code})
         return ticket_id
 
-    def update_task(self, task_id: int, status: str, actual_hours: float | None = None) -> None:
-        if status not in ALLOWED_TASK_STATUSES:
-            raise ValueError(f"invalid task status: {status}")
+    def close_ticket(self, ticket_code: str) -> None:
         with self.connect() as conn:
-            if actual_hours is None:
-                conn.execute("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?", (status, self._now(), task_id))
-            else:
-                conn.execute("UPDATE tasks SET status = ?, actual_hours = ?, updated_at = ? WHERE id = ?", (status, actual_hours, self._now(), task_id))
+            row = conn.execute("SELECT id FROM service_tickets WHERE ticket_code = ?", (ticket_code,)).fetchone()
+            if row is None:
+                raise ValueError("ticket not found")
+            conn.execute(
+                "UPDATE service_tickets SET status = 'closed', closed_at = ? WHERE ticket_code = ?",
+                (self._now(), ticket_code),
+            )
             conn.commit()
-        self._log("update_task", {"task_id": task_id, "status": status, "actual_hours": actual_hours})
+        self._log("close_ticket", {"ticket_code": ticket_code})
 
     def dashboard(self) -> dict[str, Any]:
         with self.connect() as conn:
@@ -199,7 +233,6 @@ class WorkflowDB:
                   (SELECT IFNULL(SUM(actual_hours), 0) FROM tasks) actual_hours
                 """
             ).fetchone()
-
             projects = conn.execute(
                 """
                 SELECT p.id, p.code, p.name_th, p.name_en, p.status, p.stage_gate,
@@ -211,25 +244,19 @@ class WorkflowDB:
                 ORDER BY p.created_at DESC
                 """
             ).fetchall()
-
             tasks = conn.execute(
                 """
                 SELECT t.id, p.code AS project_code, t.title_th, t.title_en, t.owner, t.priority, t.status, t.due_date
                 FROM tasks t JOIN projects p ON p.id=t.project_id
-                ORDER BY t.due_date ASC
-                LIMIT 20
+                ORDER BY t.due_date ASC LIMIT 20
                 """
             ).fetchall()
-
             tickets = conn.execute(
                 """
                 SELECT ticket_code, category, severity, title, status, assignee
-                FROM service_tickets
-                ORDER BY opened_at DESC
-                LIMIT 20
+                FROM service_tickets ORDER BY opened_at DESC LIMIT 20
                 """
             ).fetchall()
-
         metrics = dict(summary)
         metrics["completion_rate_percent"] = round((metrics["tasks_done"] / metrics["tasks"] * 100) if metrics["tasks"] else 0, 2)
         return {
@@ -250,7 +277,6 @@ class WorkflowDB:
                 ORDER BY p.code, t.id
                 """
             ).fetchall()
-
         with output_path.open("w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(["project_code", "phase", "title_th", "title_en", "owner", "priority", "status", "estimate_hours", "actual_hours", "due_date"])
@@ -280,7 +306,6 @@ def seed_full_system(db: WorkflowDB) -> None:
         status="active",
         stage_gate="gate_2",
     )
-
     tasks = [
         ("discovery", "เก็บความต้องการทุกแผนก", "Cross-department requirement discovery", "BA Team", "critical", 60, "2026-02-01"),
         ("design", "ออกแบบระบบ Workflow + SLA", "Design workflow + SLA engine", "Solution Architect", "critical", 100, "2026-03-01"),
@@ -290,115 +315,95 @@ def seed_full_system(db: WorkflowDB) -> None:
     ]
     for phase, th, en, owner, pri, est, due in tasks:
         db.add_task(project_id, phase, th, en, owner, pri, est, due)
-
     db.add_ticket(project_id, "INC-2026-001", "elevator", "high", "Emergency breakdown @ Pattaya site", "On-call Team", "in_progress")
     db.add_ticket(project_id, "SR-2026-002", "ups", "medium", "UPS battery replacement plan", "Power Team", "open")
 
 
-DASHBOARD_HTML = """<!doctype html>
-<html lang='en'>
-<head>
-<meta charset='utf-8'>
-<meta name='viewport' content='width=device-width, initial-scale=1'>
-<title>Prime Tech Enterprise - Full System</title>
-<style>
-body{font-family:Arial,sans-serif;background:#0b0d12;color:#eef;margin:0}
-header{padding:20px 28px;border-bottom:1px solid #29313f}
-.brand{color:#c7ff10;font-weight:800;font-size:28px}
-.subtitle{color:#b5bcc8}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;padding:20px}
-.card{background:#131824;border:1px solid #2a3143;border-radius:12px;padding:16px}
-.card h3{margin:0 0 8px;color:#c7ff10}
-.big{font-size:28px;font-weight:800}
-section{padding:0 20px 20px}
-table{width:100%;border-collapse:collapse;background:#131824;border:1px solid #2a3143}
-th,td{padding:10px;border-bottom:1px solid #2a3143;text-align:left;font-size:14px}
-th{color:#c7ff10}
-small{color:#7e8797}
-</style>
-</head>
-<body>
-<header>
-<div class='brand'>PRIME TECH ENTERPRISE</div>
-<div class='subtitle'>TH/EN Full-Service Workflow Platform | ระบบบริหารงานบริการครบวงจร</div>
-</header>
-<div class='grid' id='metricGrid'></div>
-<section><h2>Projects / โครงการ</h2><table id='projects'><thead><tr><th>Code</th><th>Name EN</th><th>Name TH</th><th>Status</th><th>Gate</th><th>Progress</th></tr></thead><tbody></tbody></table></section>
+DASHBOARD_HTML = """<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>Prime Tech Enterprise - Full System</title><style>
+body{font-family:Arial,sans-serif;background:#0b0d12;color:#eef;margin:0}header{padding:20px 28px;border-bottom:1px solid #29313f}
+.brand{color:#c7ff10;font-weight:800;font-size:28px}.subtitle{color:#b5bcc8}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;padding:20px}
+.card{background:#131824;border:1px solid #2a3143;border-radius:12px;padding:16px}.card h3{margin:0 0 8px;color:#c7ff10}.big{font-size:28px;font-weight:800}
+section{padding:0 20px 20px}table{width:100%;border-collapse:collapse;background:#131824;border:1px solid #2a3143}th,td{padding:10px;border-bottom:1px solid #2a3143;text-align:left;font-size:14px}th{color:#c7ff10}
+</style></head><body><header><div class='brand'>PRIME TECH ENTERPRISE</div><div class='subtitle'>TH/EN Full-Service Workflow Platform | ระบบบริหารงานบริการครบวงจร</div></header>
+<div class='grid' id='metricGrid'></div><section><h2>Projects / โครงการ</h2><table id='projects'><thead><tr><th>Code</th><th>Name EN</th><th>Name TH</th><th>Status</th><th>Gate</th><th>Progress</th></tr></thead><tbody></tbody></table></section>
 <section><h2>Tasks / งาน</h2><table id='tasks'><thead><tr><th>Project</th><th>Title EN</th><th>Title TH</th><th>Owner</th><th>Status</th><th>Due</th></tr></thead><tbody></tbody></table></section>
-<section><small id='generatedAt'></small></section>
-<script>
-async function load(){
-const res=await fetch('/api/dashboard');
-const data=await res.json();
-const m=data.metrics;
-const metrics=[['Clients','ลูกค้า',m.clients],['Projects','โครงการ',m.projects],['Tasks','งาน',m.tasks],['Done %','ความคืบหน้า',m.completion_rate_percent+'%'],['Open Tickets','ทิคเก็ตคงค้าง',m.open_tickets],['Hours (Est/Actual)','ชั่วโมง (แผน/จริง)',`${m.est_hours} / ${m.actual_hours}`]];
-const grid=document.getElementById('metricGrid');
-grid.innerHTML=metrics.map(x=>`<div class='card'><h3>${x[0]}</h3><div class='subtitle'>${x[1]}</div><div class='big'>${x[2]}</div></div>`).join('');
-const pbody=document.querySelector('#projects tbody');
-pbody.innerHTML=data.projects.map(p=>`<tr><td>${p.code}</td><td>${p.name_en}</td><td>${p.name_th}</td><td>${p.status}</td><td>${p.stage_gate}</td><td>${p.done_count}/${p.task_count}</td></tr>`).join('');
-const tbody=document.querySelector('#tasks tbody');
-tbody.innerHTML=data.tasks.map(t=>`<tr><td>${t.project_code}</td><td>${t.title_en}</td><td>${t.title_th}</td><td>${t.owner}</td><td>${t.status}</td><td>${t.due_date}</td></tr>`).join('');
-document.getElementById('generatedAt').innerText='Generated at: '+data.generated_at;
-}
-load();
-</script>
-</body>
-</html>"""
+<script>async function load(){const r=await fetch('/api/dashboard');const d=await r.json();const m=d.metrics;const n=[['Clients','ลูกค้า',m.clients],['Projects','โครงการ',m.projects],['Tasks','งาน',m.tasks],['Done %','ความคืบหน้า',m.completion_rate_percent+'%'],['Open Tickets','ทิคเก็ตคงค้าง',m.open_tickets],['Hours (Est/Actual)','ชั่วโมง (แผน/จริง)',`${m.est_hours} / ${m.actual_hours}`]];document.getElementById('metricGrid').innerHTML=n.map(x=>`<div class='card'><h3>${x[0]}</h3><div>${x[1]}</div><div class='big'>${x[2]}</div></div>`).join('');document.querySelector('#projects tbody').innerHTML=d.projects.map(p=>`<tr><td>${p.code}</td><td>${p.name_en}</td><td>${p.name_th}</td><td>${p.status}</td><td>${p.stage_gate}</td><td>${p.done_count}/${p.task_count}</td></tr>`).join('');document.querySelector('#tasks tbody').innerHTML=d.tasks.map(t=>`<tr><td>${t.project_code}</td><td>${t.title_en}</td><td>${t.title_th}</td><td>${t.owner}</td><td>${t.status}</td><td>${t.due_date}</td></tr>`).join('');}load();</script></body></html>"""
 
 
 def make_handler(db: WorkflowDB):
     class Handler(BaseHTTPRequestHandler):
-        def _send(self, body: str, code: int = 200, content_type: str = "application/json") -> None:
-            payload = body.encode("utf-8")
+        def _send_json(self, payload: dict[str, Any], code: int = 200) -> None:
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _send_text(self, body: str, content_type: str = "text/plain", code: int = 200) -> None:
+            raw = body.encode("utf-8")
             self.send_response(code)
             self.send_header("Content-Type", f"{content_type}; charset=utf-8")
-            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Content-Length", str(len(raw)))
             self.end_headers()
-            self.wfile.write(payload)
+            self.wfile.write(raw)
+
+        def _read_json(self) -> dict[str, Any]:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0:
+                raise ValueError("empty body")
+            return json.loads(self.rfile.read(length).decode("utf-8"))
 
         def do_GET(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
             if parsed.path == "/":
-                self._send(DASHBOARD_HTML, content_type="text/html")
-                return
-            if parsed.path == "/api/dashboard":
-                self._send(json.dumps(db.dashboard(), ensure_ascii=False, indent=2))
+                self._send_text(DASHBOARD_HTML, content_type="text/html")
                 return
             if parsed.path == "/api/health":
-                self._send(json.dumps({"status": "ok", "timestamp": db._now()}))
+                self._send_json({"status": "ok", "timestamp": db._now()})
+                return
+            if parsed.path == "/api/dashboard":
+                self._send_json(db.dashboard())
                 return
             if parsed.path == "/api/tasks.csv":
                 tmp = Path("data/tasks_export.csv")
                 db.export_tasks_csv(tmp)
-                self._send(tmp.read_text(encoding="utf-8"), content_type="text/csv")
+                self._send_text(tmp.read_text(encoding="utf-8"), content_type="text/csv")
                 return
-            self._send(json.dumps({"error": "not found"}), code=404)
+            self._send_json({"error": "not found"}, code=404)
 
         def do_POST(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
-            if parsed.path == "/api/task/update":
-                length = int(self.headers.get("Content-Length", "0"))
-                body = self.rfile.read(length).decode("utf-8")
-                data = json.loads(body)
-                db.update_task(int(data["task_id"]), data["status"], data.get("actual_hours"))
-                self._send(json.dumps({"ok": True}))
-                return
-            if parsed.path == "/api/ticket/create":
-                length = int(self.headers.get("Content-Length", "0"))
-                body = self.rfile.read(length).decode("utf-8")
-                data = json.loads(body)
-                tid = db.add_ticket(
-                    int(data["project_id"]),
-                    data["ticket_code"],
-                    data["category"],
-                    data["severity"],
-                    data["title"],
-                    data["assignee"],
-                    data.get("status", "open"),
-                )
-                self._send(json.dumps({"ticket_id": tid}, ensure_ascii=False), code=HTTPStatus.CREATED)
-                return
-            self._send(json.dumps({"error": "not found"}), code=404)
+            try:
+                data = self._read_json()
+                if parsed.path == "/api/task/update":
+                    db.update_task(int(data["task_id"]), data["status"], data.get("actual_hours"))
+                    self._send_json({"ok": True})
+                    return
+                if parsed.path == "/api/ticket/create":
+                    tid = db.add_ticket(
+                        int(data["project_id"]),
+                        data["ticket_code"],
+                        data["category"],
+                        data["severity"],
+                        data["title"],
+                        data["assignee"],
+                        data.get("status", "open"),
+                    )
+                    self._send_json({"ticket_id": tid}, code=HTTPStatus.CREATED)
+                    return
+                if parsed.path == "/api/project/advance-gate":
+                    next_gate = db.advance_project_gate(int(data["project_id"]))
+                    self._send_json({"next_gate": next_gate})
+                    return
+                if parsed.path == "/api/ticket/close":
+                    db.close_ticket(data["ticket_code"])
+                    self._send_json({"ok": True})
+                    return
+                self._send_json({"error": "not found"}, code=404)
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                self._send_json({"error": str(exc)}, code=400)
 
         def log_message(self, fmt: str, *args: Any) -> None:
             return
@@ -410,7 +415,6 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Prime Tech Enterprise Full Workflow TH/EN")
     parser.add_argument("--db", default=DB_DEFAULT)
     sub = parser.add_subparsers(dest="command", required=True)
-
     sub.add_parser("init-db")
     sub.add_parser("seed-full-system")
     sub.add_parser("dashboard")
@@ -450,6 +454,12 @@ def parse_args() -> argparse.Namespace:
     u.add_argument("--status", required=True)
     u.add_argument("--actual-hours", type=float)
 
+    g = sub.add_parser("advance-gate")
+    g.add_argument("--project-id", type=int, required=True)
+
+    k = sub.add_parser("close-ticket")
+    k.add_argument("--ticket-code", required=True)
+
     x = sub.add_parser("export-csv")
     x.add_argument("--output", default="exports/tasks.csv")
 
@@ -462,7 +472,6 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     db = WorkflowDB(Path(args.db))
-
     if args.command == "init-db":
         db.init_db()
         print("Initialized DB")
@@ -481,6 +490,11 @@ def main() -> None:
     elif args.command == "update-task":
         db.update_task(args.task_id, args.status, args.actual_hours)
         print("Updated")
+    elif args.command == "advance-gate":
+        print(db.advance_project_gate(args.project_id))
+    elif args.command == "close-ticket":
+        db.close_ticket(args.ticket_code)
+        print("Closed")
     elif args.command == "export-csv":
         print(db.export_tasks_csv(Path(args.output)))
     elif args.command == "serve-web":
